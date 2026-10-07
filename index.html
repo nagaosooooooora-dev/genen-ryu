@@ -199,6 +199,24 @@ dialog.sheet::backdrop { background: rgba(8, 10, 16, .55); }
 .toast button { border: 0; background: none; color: var(--gold); font-weight: 700; padding: 4px 8px; cursor: pointer; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .toast button { color: #8A5A00; } }
 :root[data-theme="dark"] .toast button { color: #8A5A00; }
+
+/* 1日の本数 */
+.days { background: var(--surface); border-radius: 14px; padding: 4px 14px 2px; }
+.day { display: grid; grid-template-columns: 6.2em 1fr 3.4em; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+.day:last-of-type { border-bottom: 0; }
+.day-date { font-size: .875rem; color: var(--muted); white-space: nowrap; }
+.day-count { text-align: right; font-weight: 700; font-size: 1.05rem; }
+.day-count small { font-size: .75rem; font-weight: 400; margin-left: 1px; }
+.day-bar { position: relative; height: 10px; background: var(--line); border-radius: 3px; }
+.day-bar span { position: absolute; left: 0; top: 0; bottom: 0; background: var(--muted); border-radius: 3px; }
+.day-bar i { position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px; background: var(--ink); }
+.day.good .day-bar span { background: #D9A520; }
+.day.good .day-count { color: #A8740C; }
+.day.bad .day-bar span { background: #C2506C; }
+.day.bad .day-count { color: #C2506C; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .day.good .day-count { color: #F0C850; } :root:not([data-theme="light"]) .day.bad .day-count { color: #E57A95; } }
+.days-note { font-size: .75rem; color: var(--muted); margin: 6px 0 8px; }
+.days-more:not([hidden]) { display: block; margin: 6px 0 0 auto; }
 </style>
 </head>
 <body>
@@ -266,6 +284,18 @@ const Domain = (() => {
     return Math.trunc((s.usual * days - smoked) * s.packPrice / s.packCount);
   }
 
+  /** 1日ごとの本数（記録を始めた日から今日まで、新しい日が先）。日の区切りはこの端末の0時 */
+  function dailyCounts(data, now) {
+    if (data.startAt == null) return [];
+    const key = t => { const d = new Date(t); return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`; };
+    const counts = new Map();
+    for (const t of data.smokes) if (t <= now) counts.set(key(t), (counts.get(key(t)) || 0) + 1);
+    const out = [], d = new Date(now); d.setHours(0, 0, 0, 0);
+    const first = new Date(Math.min(data.startAt, data.smokes[0] ?? data.startAt)); first.setHours(0, 0, 0, 0);
+    for (; d >= first; d.setDate(d.getDate() - 1)) out.push({ date: new Date(d), count: counts.get(key(d.getTime())) || 0 });
+    return out;
+  }
+
   const lastSmoke = data => data.smokes.length ? data.smokes[data.smokes.length - 1] : null;
 
   /** 経過時間を「3時間12分」の形に */
@@ -289,7 +319,7 @@ const Domain = (() => {
   /** 目標の本数を続けたときに、伝説の勇者まで何日か */
   const daysToMax = s => Math.ceil(MAX_EXP / (rates(s).p * (s.usual - s.target)));
 
-  return Object.freeze({ MIN, HOUR, DAY, MAX_EXP, toInt, normalizeSettings, validateSettings, rates, expAt, savedMoney, lastSmoke, duration, roughly, daysToMax });
+  return Object.freeze({ MIN, HOUR, DAY, MAX_EXP, toInt, normalizeSettings, validateSettings, rates, expAt, savedMoney, dailyCounts, lastSmoke, duration, roughly, daysToMax });
 })();
 
 /* =====================================================================
@@ -562,7 +592,7 @@ const UI = (() => {
   const FIELDS = ['usual', 'target', 'packPrice', 'packCount'];
 
   function mount(core, root) {
-    let previewNet = null, lastStage = null, praying = false, msgTimer = null, toastTimer = null, toastAction = null, undoArmed = null;
+    let daysShown = 7, previewNet = null, lastStage = null, praying = false, msgTimer = null, toastTimer = null, toastAction = null, undoArmed = null;
 
     root.innerHTML = `
       <main class="app">
@@ -594,6 +624,9 @@ const UI = (() => {
           <div class="stat"><dt id="since-label">最後の1本から</dt><dd id="since"></dd></div>
         </dl>
         <p class="undo-row"><button type="button" class="text-btn" id="undo" hidden>最後の1本を取り消す</button></p>
+        <h2 class="section">1日の本数</h2>
+        <div class="days" id="days"></div>
+        <button type="button" class="text-btn days-more" id="days-more" hidden>もっと前を見る</button>
         <h2 class="section">設定</h2>
         <div class="plan" id="plan"></div>
         <button type="button" class="rpg-btn small plan-edit" id="edit">設定を変える</button>
@@ -681,6 +714,24 @@ const UI = (() => {
         <div class="plan-row"><span>目標</span><span>1日 ${s.target}本</span></div>
         <div class="plan-row"><span>1本の値段</span><span>約${Math.round(s.packPrice / s.packCount * 10) / 10}円</span></div>` : '';
       $('#dock').hidden = !s;
+      renderDays();
+    }
+
+    /* 1日の本数：目標以下は金、いつもより多い日は赤 */
+    const WEEK = '日月火水木金土';
+    function renderDays() {
+      const st = core.getState(), s = st.settings, days = Domain.dailyCounts(st, Date.now());
+      const list = days.slice(0, daysShown);
+      $('#days').innerHTML = !s ? '' : list.map((d, i) => {
+        const cls = d.count > s.usual ? 'bad' : d.count <= s.target && i > 0 ? 'good' : '';   // 今日はまだ途中なので、金にはしない
+        const w = Math.min(100, d.count / Math.max(s.usual, 1) * 100);
+        return `<div class="day ${cls}">
+          <span class="day-date">${i === 0 ? '今日' : `${d.date.getMonth() + 1}/${d.date.getDate()}（${WEEK[d.date.getDay()]}）`}</span>
+          <span class="day-bar" aria-hidden="true"><span style="width:${w}%"></span><i style="left:${s.target / s.usual * 100}%"></i></span>
+          <span class="day-count">${d.count}<small>本</small></span>
+        </div>`;
+      }).join('') + (s ? `<p class="days-note">｜は目標の${s.target}本。バーの右はしが、いつもの${s.usual}本です。</p>` : '');
+      $('#days-more').hidden = days.length <= daysShown;
     }
 
     function render() { renderStats(); return renderJourney(); }
@@ -732,6 +783,7 @@ const UI = (() => {
     sheet.addEventListener('cancel', e => { if (!core.getState().settings) e.preventDefault(); });
     sheet.addEventListener('click', e => { if (e.target === sheet && core.getState().settings) sheet.close(); });
     $('#edit').addEventListener('click', openSheet);
+    $('#days-more').addEventListener('click', () => { daysShown += 30; renderDays(); });
 
     /* 吸った・取り消し */
     const undo = () => { const r = core.undoLast(); toast(r.ok ? '取り消しました' : r.error, { error: !r.ok }); };
